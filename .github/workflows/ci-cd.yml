@@ -1,0 +1,91 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: cicd-app
+  ECS_CLUSTER: cicd-app-cluster
+  ECS_SERVICE: cicd-app-service
+  ALB_NAME: cicd-app-alb
+
+jobs:
+  test:
+    name: Test and build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: pytest -v
+
+      - name: Build Docker image (no push)
+        run: docker build -t cicd-app:test .
+
+  deploy:
+    name: Deploy to AWS
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image to ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker build \
+            -t $REGISTRY/$ECR_REPOSITORY:${{ github.sha }} \
+            -t $REGISTRY/$ECR_REPOSITORY:latest .
+          docker push --all-tags $REGISTRY/$ECR_REPOSITORY
+
+      - name: Deploy to ECS
+        run: |
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+
+      - name: Smoke test the load balancer
+        run: |
+          URL=$(aws elbv2 describe-load-balancers --names $ALB_NAME \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          echo "Testing http://$URL"
+          for i in $(seq 1 12); do
+            if curl -fs http://$URL | grep -q "Hello from CI/CD Pipeline!"; then
+              echo "App is live and returning the expected message"
+              exit 0
+            fi
+            echo "Not ready yet, retrying in 10s..."
+            sleep 10
+          done
+          echo "Smoke test failed"
+          exit 1
